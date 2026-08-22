@@ -75,6 +75,31 @@ CREATE TABLE IF NOT EXISTS account_push_settings (
     updated_at     INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS proxy_provider_profiles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL UNIQUE,
+    provider   TEXT    NOT NULL DEFAULT 'ipzan',
+    proxy_type TEXT    NOT NULL DEFAULT 'http',
+    api_url    TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS account_proxy_settings (
+    account_id             INTEGER PRIMARY KEY REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    mode                   TEXT    NOT NULL DEFAULT 'direct',
+    proxy_type             TEXT    NOT NULL DEFAULT 'http',
+    static_proxy           TEXT    NOT NULL DEFAULT '',
+    api_url                TEXT    NOT NULL DEFAULT '',
+    provider_profile_id    INTEGER,
+    region_code            TEXT    NOT NULL DEFAULT '',
+    region_province        TEXT    NOT NULL DEFAULT '',
+    region_city            TEXT    NOT NULL DEFAULT '',
+    refresh_ahead_seconds  INTEGER NOT NULL DEFAULT 300,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
@@ -110,17 +135,19 @@ type WechatAccount struct {
 }
 
 type AccountPublic struct {
-	ID            int64   `json:"id"`
-	OpenID        string  `json:"openid"`
-	UIN           *int64  `json:"uin"`
-	Alias         *string `json:"alias"`
-	Nickname      *string `json:"nickname"`
-	Remark        *string `json:"remark"`
-	Avatar        *string `json:"avatar"`
-	Status        *string `json:"status"`
-	LastCheckedAt *int64  `json:"last_checked_at"`
-	CreatedAt     int64   `json:"created_at"`
-	UpdatedAt     int64   `json:"updated_at"`
+	ID                     int64   `json:"id"`
+	OpenID                 string  `json:"openid"`
+	UIN                    *int64  `json:"uin"`
+	Alias                  *string `json:"alias"`
+	Nickname               *string `json:"nickname"`
+	Remark                 *string `json:"remark"`
+	Avatar                 *string `json:"avatar"`
+	Status                 *string `json:"status"`
+	RefreshTokenObservedAt *int64  `json:"refresh_token_observed_at,omitempty"`
+	RescanRecommended      bool    `json:"rescan_recommended"`
+	LastCheckedAt          *int64  `json:"last_checked_at"`
+	CreatedAt              int64   `json:"created_at"`
+	UpdatedAt              int64   `json:"updated_at"`
 }
 
 type SessionRow struct {
@@ -173,6 +200,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateAccountRemark(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateAccountProxySettings(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -262,6 +293,52 @@ func migrateAccountRemark(ctx context.Context, db *sql.DB) error {
 	}
 	_, err = db.ExecContext(ctx, "ALTER TABLE wechat_accounts ADD COLUMN remark TEXT")
 	return err
+}
+
+func migrateAccountProxySettings(ctx context.Context, db *sql.DB) error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{"provider_profile_id", "INTEGER"},
+		{"region_code", "TEXT NOT NULL DEFAULT ''"},
+		{"region_province", "TEXT NOT NULL DEFAULT ''"},
+		{"region_city", "TEXT NOT NULL DEFAULT ''"},
+		{"refresh_ahead_seconds", "INTEGER NOT NULL DEFAULT 300"},
+	}
+	for _, column := range columns {
+		exists, err := sqliteColumnExists(ctx, db, "account_proxy_settings", column.name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err = db.ExecContext(ctx, "ALTER TABLE account_proxy_settings ADD COLUMN "+column.name+" "+column.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sqliteColumnExists(ctx context.Context, db *sql.DB, table, wanted string) (bool, error) {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == wanted {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, alias, nickname, avatar *string, userInfo map[string]any, credentials map[string]any, status *string) (*WechatAccount, error) {
@@ -446,6 +523,11 @@ func (db *DB) InvalidateSession(ctx context.Context, accountID int64, tcpProxy s
 	return err
 }
 
+func (db *DB) InvalidateAccountSessions(ctx context.Context, accountID int64) error {
+	_, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=?", accountID)
+	return err
+}
+
 func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {
 	res, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at<=?", time.Now().Unix())
 	if err != nil {
@@ -512,18 +594,49 @@ func (db *DB) GetFeatureByName(ctx context.Context, name string) (*Feature, erro
 }
 
 func (a *WechatAccount) Public() AccountPublic {
+	var refreshTokenObservedAt *int64
+	rescanRecommended := false
+	if stringCredential(a.Credentials, "refreshtoken") != "" {
+		if observedAt := int64Credential(a.Credentials, "refresh_token_observed_at"); observedAt > 0 {
+			refreshTokenObservedAt = &observedAt
+			rescanRecommended = time.Now().Unix()-observedAt >= int64((25*24*time.Hour)/time.Second)
+		}
+	}
 	return AccountPublic{
-		ID:            a.ID,
-		OpenID:        a.OpenID,
-		UIN:           a.UIN,
-		Alias:         a.Alias,
-		Nickname:      a.Nickname,
-		Remark:        a.Remark,
-		Avatar:        a.Avatar,
-		Status:        a.Status,
-		LastCheckedAt: a.LastCheckedAt,
-		CreatedAt:     a.CreatedAt,
-		UpdatedAt:     a.UpdatedAt,
+		ID:                     a.ID,
+		OpenID:                 a.OpenID,
+		UIN:                    a.UIN,
+		Alias:                  a.Alias,
+		Nickname:               a.Nickname,
+		Remark:                 a.Remark,
+		Avatar:                 a.Avatar,
+		Status:                 a.Status,
+		RefreshTokenObservedAt: refreshTokenObservedAt,
+		RescanRecommended:      rescanRecommended,
+		LastCheckedAt:          a.LastCheckedAt,
+		CreatedAt:              a.CreatedAt,
+		UpdatedAt:              a.UpdatedAt,
+	}
+}
+
+func stringCredential(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return value
+}
+
+func int64Credential(values map[string]any, key string) int64 {
+	switch value := values[key].(type) {
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	case float64:
+		return int64(value)
+	case json.Number:
+		result, _ := value.Int64()
+		return result
+	default:
+		return 0
 	}
 }
 
